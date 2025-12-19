@@ -149,6 +149,9 @@ cd "$RDIR"
 
     # Only shallow clone needed for basic SW tests
     git submodule update --init software/firemarshal
+    
+    # Non-recursive clone
+    git submodule update --init toolchains/riscv-tools/riscv-dv
 )
 
 # Configure firemarshal to know where our firesim installation is
