@@ -4,28 +4,36 @@
 # Usage: TIMEOUT_CYCLES=1000000 DEBUG=1 ./run_parallel_tests.sh
 #
 # Options:
-#   BINARY_DIR      - Test binary directory (default: /root/riscv-dv/RV32IMC/asm_test)
-#   CONFIG          - Rocket config (default: RV32RocketConfig)
-#   TIMEOUT_CYCLES  - Max simulation cycles (default: 10000000)
-#   MAX_PARALLEL    - Parallel jobs (default: nproc)
-#   TEST_PATTERN    - File pattern (default: *.o)
-#   EXCLUDE_PATTERN - Regex pattern to exclude tests (default: none)
-#   DEBUG           - Enable waveform: 1=on, 0=off (default: 0)
+#   RISCV_DV_OUT_DIR - Test binary directory (default: /root/riscv-dv/RV32IMC/asm_test)
+#   CONFIG           - Rocket config (default: RV32RocketConfig)
+#   TIMEOUT_CYCLES   - Max simulation cycles (default: 10000000)
+#   MAX_PARALLEL     - Parallel jobs (default: nproc)
+#   TEST_PATTERN     - File pattern (default: *.o)
+#   EXCLUDE_PATTERN  - Regex pattern to exclude tests (default: none)
+#   DEBUG            - Enable waveform: 1=on, 0=off (default: 0)
 
 source ./env.sh
 
 # Configuration
-DEFAULT_BINARY_DIR="$RISCV_DV_DIR/out_2025-12-19/asm_test"  # DB별 날짜 변경 필요
+DEFAULT_RISCV_DV_OUT_DIR="out"
 DEFAULT_CONFIG="RV32RocketConfig"
 TIMEOUT_CYCLES=${TIMEOUT_CYCLES:-10000000}
 TEST_PATTERN=${TEST_PATTERN:-"*.o"}
+GEN_VECTOR=${GEN_VECTOR:-0}
 DEBUG=${DEBUG:-0} # 파형 생성할 때
 
-BINARY_DIR="${BINARY_DIR:-${DEFAULT_BINARY_DIR}}"
+RISCV_DV_OUT_DIR="${RISCV_DV_OUT_DIR:-${DEFAULT_RISCV_DV_OUT_DIR}}"
 CONFIG="${CONFIG:-${DEFAULT_CONFIG}}"
 MAX_PARALLEL=${MAX_PARALLEL:-$(nproc)}
 #EXCLUDE_PATTERN="^(riscv_rand_instr_test_|riscv_arithmetic_basic_test_)"
 EXCLUDE_PATTERN=${EXCLUDE_PATTERN:-""}
+
+BINARY_DIR="${RISCV_DV_DIR}/${RISCV_DV_OUT_DIR}/asm_test"
+
+if [[ ${GEN_VECTOR} -eq 1 ]]; then
+    export RISCV_DV_OUT_DIR
+    ./generate_test_vector.sh "${RISCV_DV_OUT_DIR}"
+fi
 
 # Setup
 RESULT_DIR=$(mktemp -d)
@@ -174,5 +182,7 @@ if [[ ${#TIMEOUTS[@]} -gt 0 ]]; then
     printf '  - %s\n' "${TIMEOUTS[@]}"
 fi
 
-rm -rf "${RESULT_DIR}"
-[[ ${#FAILED[@]} -eq 0 && ${#TIMEOUTS[@]} -eq 0 ]] && echo -e "\nAll tests passed! ✓" && exit 0 || exit 1
+#rm -rf "${RESULT_DIR}"
+#[[ ${#FAILED[@]} -eq 0 && ${#TIMEOUTS[@]} -eq 0 ]] && echo -e "\nAll tests passed! ✓" && exit 0 || exit 1
+
+./compare_all.sh "${BINARY_DIR}" "output/chipyard.harness.TestHarness.${CONFIG}"
