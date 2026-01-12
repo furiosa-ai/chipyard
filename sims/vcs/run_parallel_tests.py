@@ -31,6 +31,57 @@ def timestamp():
     """Return formatted timestamp"""
     return datetime.now().strftime('%H:%M:%S')
 
+def get_simv_path(script_dir: Path, config: str, debug: bool = False) -> Path:
+    """Get the simv binary path for the given config"""
+    suffix = "-debug" if debug else ""
+    # simv naming: simv-{MODEL_PACKAGE}-{CONFIG}[-debug]
+    # MODEL_PACKAGE defaults to "chipyard.harness"
+    return script_dir / f"simv-chipyard.harness-{config}{suffix}"
+
+def check_and_build_simv(script_dir: Path, config: str, debug: bool = False) -> bool:
+    """
+    Check if simv exists, build if not.
+    Returns True if simv is ready, False if build failed.
+    """
+    simv_path = get_simv_path(script_dir, config, debug)
+    simv_type = "debug" if debug else "default"
+    
+    if simv_path.exists():
+        print(f"[{timestamp()}] Found existing simv ({simv_type}): {simv_path.name}")
+        return True
+    
+    print(f"[{timestamp()}] simv not found: {simv_path.name}")
+    print(f"[{timestamp()}] Building simv for {config} ({simv_type})...")
+    print("=" * 50)
+    
+    # Build command
+    make_target = "debug" if debug else "default"
+    cmd = ['make', f'CONFIG={config}', make_target]
+    
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=script_dir,
+            check=False
+        )
+        
+        if proc.returncode != 0:
+            print(f"[{timestamp()}] ERROR: simv build failed with exit code {proc.returncode}")
+            return False
+        
+        # Verify simv was created
+        if not simv_path.exists():
+            print(f"[{timestamp()}] ERROR: Build completed but simv not found at {simv_path}")
+            return False
+        
+        print("=" * 50)
+        print(f"[{timestamp()}] simv build complete: {simv_path.name}")
+        return True
+        
+    except Exception as e:
+        print(f"[{timestamp()}] ERROR: Build failed with exception: {e}")
+        return False
+
 def cleanup_handler(signum, frame):
     """Handle SIGINT/SIGTERM and cleanup processes"""
     print("\n\nCleaning up...")
@@ -89,11 +140,13 @@ def run_single_test(test_file: Path, config: str, timeout_cycles: int,
     make_target = "run-binary-debug" if debug else "run-binary"
     
     # Build command
+    # BREAK_SIM_PREREQ=1 prevents each process from trying to rebuild simv
     cmd = [
         'make',
         f'CONFIG={config}',
         f'BINARY={test_file}',
         f'TIMEOUT_CYCLES={timeout_cycles}',
+        'BREAK_SIM_PREREQ=1',
         make_target
     ]
     
@@ -141,9 +194,22 @@ def run_single_test(test_file: Path, config: str, timeout_cycles: int,
     elif exit_code != 0:
         status = "FAILED"
         reason = f"(exit: {exit_code})"
-    else:
+    elif check_log_for_pattern(log_file, r'\*\*\* PASSED \*\*\*|tohost\s*=\s*1\b'):
+        # Explicit pass pattern found
         status = "PASSED"
         reason = ""
+    elif check_log_for_pattern(log_file, r'\*\*\* FAILED \*\*\*|tohost\s*=\s*[^1]'):
+        # Explicit fail pattern found
+        status = "FAILED"
+        reason = "(test failed)"
+    elif check_log_for_pattern(log_file, r'Match:\s*0\b|Mismatch:\s*[1-9]'):
+        # No matches or has mismatches
+        status = "FAILED"
+        reason = "(no match)"
+    else:
+        # exit_code == 0 but no explicit pass pattern - suspicious
+        status = "FAILED"
+        reason = "(no pass pattern)"
     
     # Write result
     result_file.write_text(f"{status}:{test_name}")
@@ -257,6 +323,11 @@ def main():
     
     if not tests:
         print("No tests found!")
+        sys.exit(1)
+    
+    # Check and build simv if needed
+    if not check_and_build_simv(script_dir, args.config, args.debug):
+        print("Error: Failed to build simv. Cannot run tests.")
         sys.exit(1)
     
     # Create directories

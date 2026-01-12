@@ -103,12 +103,20 @@ def main():
             # Check if comparison passed
             with open(compare_log, 'r') as log_f:
                 log_content = log_f.read()
-                if 'PASSED' in log_content:
-                    results.append((test_name, True, "PASSED"))
-                    pass_count += 1
-                    print(f"[PASS] {test_name}")
+                if '[PASSED]' in log_content:
+                    import re
+                    match = re.search(r'\[PASSED\]:\s*(\d+)\s*matched', log_content)
+                    if match and int(match.group(1)) > 0:
+                        results.append((test_name, True, "PASSED"))
+                        pass_count += 1
+                        print(f"[PASS] {test_name}")
+                    else:
+                        # PASSED but 0 matched - this is suspicious
+                        results.append((test_name, False, "0 matched (empty trace?)"))
+                        fail_count += 1
+                        print(f"[FAIL] {test_name} (0 matched)")
                 else:
-                    results.append((test_name, False, f"Missing PASSED in {compare_log}"))
+                    results.append((test_name, False, f"FAILED or missing result in {compare_log}"))
                     fail_count += 1
                     print(f"[FAIL] {test_name}")
         
