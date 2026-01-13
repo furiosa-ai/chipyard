@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-RISC-V DV Parallel Test Runner
+RISC-V Unit Tests Parallel Runner
 
 Usage examples:
-    ./run_parallel_tests.py
-    ./run_parallel_tests.py --config RV64RocketConfig --parallel 8
-    ./run_parallel_tests.py --timeout-cycles 1000000 --debug
-    ./run_parallel_tests.py --exclude "^riscv_rand_instr_test_"
+    ./run_parallel_unit_tests.py
+    ./run_parallel_unit_tests.py --config RV32RocketConfig --parallel 20
+    ./run_parallel_unit_tests.py --pattern "rv32ui-p-*" --timeout-cycles 10000000
+    ./run_parallel_unit_tests.py --exclude ".*-v-.*"
 """
 
 import os
@@ -22,7 +22,6 @@ from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Tuple, Dict
-import multiprocessing
 
 # Global process tracking for cleanup
 active_processes = []
@@ -34,8 +33,6 @@ def timestamp():
 def get_simv_path(script_dir: Path, config: str, debug: bool = False) -> Path:
     """Get the simv binary path for the given config"""
     suffix = "-debug" if debug else ""
-    # simv naming: simv-{MODEL_PACKAGE}-{CONFIG}[-debug]
-    # MODEL_PACKAGE defaults to "chipyard.harness"
     return script_dir / f"simv-chipyard.harness-{config}{suffix}"
 
 def check_and_build_simv(script_dir: Path, config: str, debug: bool = False) -> bool:
@@ -54,22 +51,16 @@ def check_and_build_simv(script_dir: Path, config: str, debug: bool = False) -> 
     print(f"[{timestamp()}] Building simv for {config} ({simv_type})...")
     print("=" * 50)
     
-    # Build command
     make_target = "debug" if debug else "default"
     cmd = ['make', f'CONFIG={config}', make_target]
     
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=script_dir,
-            check=False
-        )
+        proc = subprocess.run(cmd, cwd=script_dir, check=False)
         
         if proc.returncode != 0:
             print(f"[{timestamp()}] ERROR: simv build failed with exit code {proc.returncode}")
             return False
         
-        # Verify simv was created
         if not simv_path.exists():
             print(f"[{timestamp()}] ERROR: Build completed but simv not found at {simv_path}")
             return False
@@ -86,17 +77,14 @@ def cleanup_handler(signum, frame):
     """Handle SIGINT/SIGTERM and cleanup processes"""
     print("\n\nCleaning up...")
     
-    # Terminate our tracked processes
     for proc in active_processes:
         try:
             proc.terminate()
         except:
             pass
     
-    # Wait a bit for graceful termination
     time.sleep(1)
     
-    # Force kill if needed
     for proc in active_processes:
         try:
             proc.kill()
@@ -105,11 +93,8 @@ def cleanup_handler(signum, frame):
     
     sys.exit(130)
 
-def check_log_for_pattern(log_file: Path, pattern: str, timeout: int = 30) -> bool:
-    """
-    Check if pattern exists in log file with timeout.
-    Uses efficient line-by-line reading for large files.
-    """
+def check_log_for_pattern(log_file: Path, pattern: str) -> bool:
+    """Check if pattern exists in log file."""
     if not log_file.exists():
         return False
     
@@ -130,7 +115,7 @@ def run_single_test(test_file: Path, config: str, timeout_cycles: int,
     """
     Run a single test and return (test_name, result_status)
     """
-    test_name = test_file.stem  # filename without extension
+    test_name = test_file.name  # filename (no extension for unit tests)
     log_file = log_dir / f"{test_name}.log"
     result_file = result_dir / f"{test_name}.result"
     output_dir = script_dir / "output" / f"chipyard.harness.TestHarness.{config}"
@@ -142,7 +127,6 @@ def run_single_test(test_file: Path, config: str, timeout_cycles: int,
     make_target = "run-binary-debug" if debug else "run-binary"
     
     # Build command
-    # BREAK_SIM_PREREQ=1 prevents each process from trying to rebuild simv
     cmd = [
         'make',
         f'CONFIG={config}',
@@ -160,21 +144,20 @@ def run_single_test(test_file: Path, config: str, timeout_cycles: int,
                 stdout=log_f,
                 stderr=subprocess.STDOUT,
                 cwd=script_dir,
-                preexec_fn=os.setsid  # Create new process group
+                preexec_fn=os.setsid
             )
             active_processes.append(proc)
             
             try:
                 exit_code = proc.wait(timeout=wall_timeout)
             except subprocess.TimeoutExpired:
-                # Kill process group
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 time.sleep(1)
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except:
                     pass
-                exit_code = 124  # timeout exit code
+                exit_code = 124
             finally:
                 if proc in active_processes:
                     active_processes.remove(proc)
@@ -183,7 +166,7 @@ def run_single_test(test_file: Path, config: str, timeout_cycles: int,
         result_file.write_text(f"FAILED:{test_name}")
         return test_name, "FAILED"
     
-    # Determine result
+    # Determine result by checking .out file first, then log file
     if exit_code == 124:
         status = "TIMEOUT"
         reason = "(wall-clock)"
@@ -193,20 +176,15 @@ def run_single_test(test_file: Path, config: str, timeout_cycles: int,
     elif out_file.exists() and check_log_for_pattern(out_file, r'\*\*\* FAILED \*\*\*'):
         status = "FAILED"
         reason = "(test failed)"
+    elif check_log_for_pattern(log_file, r'Fatal:'):
+        status = "FAILED"
+        reason = "(Fatal error)"
     elif check_log_for_pattern(log_file, r'Fatal:.*TestDriver.*at time.*ps'):
         status = "TIMEOUT"
         reason = "(max-cycles)"
-    elif check_log_for_pattern(log_file, r'Error:|Assertion failed') and \
-         not check_log_for_pattern(log_file, r'Fatal:.*TestDriver.*at time'):
-        status = "FAILED"
-        reason = ""
     elif exit_code != 0:
         status = "FAILED"
         reason = f"(exit: {exit_code})"
-    elif check_log_for_pattern(log_file, r'Match:\s*0\b|Mismatch:\s*[1-9]'):
-        # No matches or has mismatches
-        status = "FAILED"
-        reason = "(no match)"
     else:
         # exit_code == 0 but no explicit pass pattern
         status = "FAILED"
@@ -226,7 +204,11 @@ def collect_tests(binary_dir: Path, pattern: str, exclude_pattern: str) -> List[
         if not test_file.is_file():
             continue
         
-        # Check exclude pattern (applied to basename only)
+        # Skip .dump files
+        if test_file.suffix == '.dump':
+            continue
+        
+        # Check exclude pattern
         if exclude_pattern:
             try:
                 if re.search(exclude_pattern, test_file.name):
@@ -241,18 +223,17 @@ def collect_tests(binary_dir: Path, pattern: str, exclude_pattern: str) -> List[
 
 def main():
     parser = argparse.ArgumentParser(
-        description='RISC-V DV Parallel Test Runner',
+        description='RISC-V Unit Tests Parallel Runner',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
     
-    # Get riscv-dv directory
     script_dir = Path(__file__).parent.resolve()
-    riscv_dv_dir = script_dir / '../../toolchains/riscv-tools/riscv-dv'
+    default_binary_dir = script_dir / '../../toolchains/riscv-tools/riscv-tests/isa'
     
-    parser.add_argument('--out-dir', 
-                        default='out',
-                        help='RISCV-DV output directory name (default: out)')
+    parser.add_argument('--binary-dir', '-b',
+                        default=str(default_binary_dir),
+                        help=f'Binary directory (default: {default_binary_dir})')
     parser.add_argument('--config', '-c',
                         default='RV32RocketConfig',
                         help='Rocket config (default: RV32RocketConfig)')
@@ -262,32 +243,24 @@ def main():
                         help='Max simulation cycles (default: 10000000)')
     parser.add_argument('--wall-timeout', '-w',
                         type=int,
-                        default=3600,
-                        help='Wall-clock timeout in seconds (default: 3600)')
+                        default=1000,
+                        help='Wall-clock timeout in seconds (default: 1000)')
     parser.add_argument('--parallel', '-j',
                         type=int,
-                        #default=multiprocessing.cpu_count(),
-                        #help='Number of parallel jobs (default: nproc)')
                         default=20,
-                        help='Number of parallel jobs (default: 20)')   
+                        help='Number of parallel jobs (default: 20)')
     parser.add_argument('--pattern', '-p',
-                        default='*.o',
-                        help='Test file pattern (default: *.o)')
+                        default='rv32*',
+                        help='Test file pattern (default: rv32*)')
     parser.add_argument('--exclude', '-e',
                         default='',
                         help='Regex pattern to exclude tests (applied to basename)')
     parser.add_argument('--debug', '-d',
                         action='store_true',
                         help='Enable waveform generation')
-    parser.add_argument('--gen-vector', '-g',
-                        action='store_true',
-                        help='Generate test vectors before running')
     parser.add_argument('--log-dir',
-                        default='logs',
-                        help='Directory for log files (default: logs)')
-    parser.add_argument('--no-compare',
-                        action='store_true',
-                        help='Skip comparison step at the end')
+                        default='logs_unit',
+                        help='Directory for log files (default: logs_unit)')
     
     args = parser.parse_args()
     
@@ -296,25 +269,8 @@ def main():
     signal.signal(signal.SIGTERM, cleanup_handler)
     
     # Resolve paths
-    if not riscv_dv_dir.exists():
-        print(f"Error: riscv-dv directory not found at {riscv_dv_dir}")
-        sys.exit(1)
+    binary_dir = Path(args.binary_dir)
     
-    binary_dir = riscv_dv_dir / args.out_dir / 'asm_test'
-    
-    # Generate test vectors if requested
-    if args.gen_vector:
-        print("Generating test vectors...")
-        gen_script = script_dir / 'generate_test_vector.py'
-        if gen_script.exists():
-            subprocess.run([
-                str(gen_script),
-                '--out-dir', args.out_dir
-            ], check=True)
-        else:
-            print(f"Warning: {gen_script} not found, skipping generation")
-    
-    # Check binary directory
     if not binary_dir.exists():
         print(f"Error: Binary directory not found: {binary_dir}")
         sys.exit(1)
@@ -323,7 +279,7 @@ def main():
     tests = collect_tests(binary_dir, args.pattern, args.exclude)
     
     if not tests:
-        print("No tests found!")
+        print(f"No tests found matching pattern '{args.pattern}'!")
         sys.exit(1)
     
     # Check and build simv if needed
@@ -334,13 +290,13 @@ def main():
     # Create directories
     log_dir = Path(args.log_dir)
     log_dir.mkdir(exist_ok=True)
-    result_dir = Path(tempfile.mkdtemp(prefix='test_results_'))
+    result_dir = Path(tempfile.mkdtemp(prefix='unit_test_results_'))
     
     try:
         # Print configuration
-        print("=" * 50)
-        print("RISC-V DV Parallel Test Runner")
-        print("=" * 50)
+        print("=" * 60)
+        print("RISC-V Unit Tests Parallel Runner")
+        print("=" * 60)
         print(f"Config:         {args.config}")
         print(f"Binary dir:     {binary_dir}")
         print(f"Log dir:        {log_dir.absolute()}")
@@ -351,7 +307,7 @@ def main():
         print(f"Pattern:        {args.pattern}")
         print(f"Exclude:        {args.exclude or '(none)'}")
         print(f"Debug mode:     {args.debug}")
-        print("=" * 50)
+        print("=" * 60)
         print()
         
         # Run tests in parallel
@@ -378,7 +334,7 @@ def main():
                 except Exception as e:
                     test_file = futures[future]
                     print(f"[ERROR] Exception for {test_file.name}: {e}")
-                    results[test_file.stem] = "FAILED"
+                    results[test_file.name] = "FAILED"
         
         print("\nWaiting for all tests to complete...")
         time.sleep(1)
@@ -398,14 +354,14 @@ def main():
         
         # Print summary
         print()
-        print("=" * 50)
+        print("=" * 60)
         print(f"Summary: {args.config}")
-        print("=" * 50)
+        print("=" * 60)
         print(f"Total:      {len(tests)}")
         print(f"Passed:     {len(passed)}")
         print(f"Failed:     {len(failed)}")
         print(f"Timed Out:  {len(timeouts)}")
-        print("=" * 50)
+        print("=" * 60)
         
         if failed:
             print("\nFailed tests:")
@@ -417,25 +373,8 @@ def main():
             for test in sorted(timeouts):
                 print(f"  - {test}")
         
-        # Run comparison if requested
-        compare_failed = False
-        if not args.no_compare:
-            print("\nRunning comparison...")
-            compare_script = script_dir / 'compare_all.py'
-            if compare_script.exists():
-                output_dir = f"output/chipyard.harness.TestHarness.{args.config}"
-                result = subprocess.run([
-                    str(compare_script),
-                    str(binary_dir),
-                    output_dir
-                ])
-                if result.returncode != 0:
-                    compare_failed = True
-            else:
-                print(f"Warning: {compare_script} not found, skipping comparison")
-        
         # Exit with appropriate code
-        if failed or timeouts or compare_failed:
+        if failed or timeouts:
             sys.exit(1)
         else:
             print("\nAll tests passed! ✓")
